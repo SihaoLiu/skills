@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# watch-codex-goal - keep a Codex "/goal" run in a tmux session unblocked.
+#
+# It locates the tmux pane whose last few lines contain a status line matching
+# ALL of the given marks (--mark, repeatable), then watches that line. When that
+# line - or the line immediately above or below it - shows "blocked"
+# (case-insensitive) and is still blocked 15 minutes later, it sends
+# "/goal resume" + Enter into the pane and keeps retrying every 15 minutes until
+# the block clears.
+#
+# Usage:
+#   watch-codex-goal [--session NAME] [--tail N] \
+#                    [--mark STR]... [--dry-run] [-h|--help]
+#
+#   --session NAME  tmux session to watch                       (default: youProject)
+#   --tail N        trailing non-blank lines scanned for the marks    (default: 3)
+#   --mark STR      keyword the target status line must contain; pass --mark once
+#                   per keyword - the target line must contain ALL of them. Quote
+#                   values that contain spaces, e.g.:
+#                     --mark gpt --mark "My Mark" --mark 123_123ABC
+#                   If no --mark is given, defaults to: gpt, opt-youProject
+#   --dry-run   find the target pane, type "continue" + Enter into it, and exit.
+#               A non-destructive check that pane discovery and key-sending work.
+#               (It does NOT look for "blocked".)
+#
+# Behaviour (normal mode):
+#   1. Find the target tmux session (--session, default youProject).
+#   2. Across its panes, find one whose last <tail> (non-blank) lines contain a
+#      line holding ALL marks -> that pane is the target, that line is the
+#      target line.
+#   3. Every 15 minutes, re-read the target line; if it (or the line just above
+#      or below it) contains "blocked", go to step 4.
+#   4. Wait 15 minutes and re-check. If still blocked, send "/goal resume"+Enter,
+#      wait 30s and re-check. While still blocked, wait 15 minutes and resend,
+#      until the block clears.
+#   5. If no target pane/line is found, do nothing and re-search after 1 minute.
+#
+# Session / tail / marks are set via the flags above (no longer environment vars).
+# Remaining tunables (environment; WCG_ prefix; override mainly for testing):
+#   WCG_CHECK_INTERVAL (900s monitoring poll)
+#   WCG_CONFIRM_WAIT (900s confirm/backoff)   WCG_POST_RESUME_WAIT (30s)
+#   WCG_SEARCH_INTERVAL (60s)  WCG_RESUME_CMD (/goal resume)  WCG_DRY_CMD (continue)
+#   WCG_SEND_DELAY (0.4s pause between typing text and pressing Enter)
+set -uo pipefail
+
+# Defaults for the flag-configurable settings (override with --session / --tail /
+# --mark). Marks are collected into an array during argument parsing below.
+SESSION="youProject"
+TAIL_LINES="3"
+DEFAULT_MARKS=(gpt opt-youProject)
+MARKS=()
+
+# Remaining tunables stay as environment variables (WCG_ prefix).
+CHECK_INTERVAL="${WCG_CHECK_INTERVAL:-900}"      # 15 min: normal monitoring poll
+CONFIRM_WAIT="${WCG_CONFIRM_WAIT:-900}"          # 15 min: confirm / between resends
+POST_RESUME_WAIT="${WCG_POST_RESUME_WAIT:-30}"   # 30 s: settle after a resume
+SEARCH_INTERVAL="${WCG_SEARCH_INTERVAL:-60}"     # 1 min: retry when nothing found
+RESUME_CMD="${WCG_RESUME_CMD:-/goal resume}"
+DRY_CMD="${WCG_DRY_CMD:-continue}"
+SEND_DELAY="${WCG_SEND_DELAY:-0.4}"              # pause between typing text and Enter
+
+# Never monitor the pane this watcher runs in: its own log lines echo the marks,
+# which would otherwise make its own pane a false target.
+SELF_PANE="${WCG_SELF_PANE:-${TMUX_PANE:-}}"
+
+DRY_RUN=0
+
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
+log() { printf '%s [watch-codex-goal] %s\n' "$(date '+%F %T %Z')" "$*"; }
+die() { printf 'watch-codex-goal: %s\n' "$*" >&2; exit 1; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --session) [[ $# -ge 2 ]] || die "--session needs a value"; SESSION="$2"; shift 2 ;;
+    --tail)    [[ $# -ge 2 ]] || die "--tail needs a value";    TAIL_LINES="$2"; shift 2 ;;
+    --mark)    [[ $# -ge 2 ]] || die "--mark needs a value";    MARKS+=("$2"); shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: $1 (try --help)" ;;
+  esac
+done
+
+# Fall back to the default marks when none were given on the command line.
+(( ${#MARKS[@]} )) || MARKS=("${DEFAULT_MARKS[@]}")
+
+[[ "$TAIL_LINES" =~ ^[1-9][0-9]*$ ]] || die "--tail must be a positive integer (got '$TAIL_LINES')"
+
+# Human-readable join of the marks for log output, e.g. "gpt + opt-youProject".
+MARKS_DISPLAY="$(printf '%s + ' "${MARKS[@]}")"; MARKS_DISPLAY="${MARKS_DISPLAY% + }"
+
+command -v tmux >/dev/null 2>&1 || die "tmux is not installed"
+
+# Last $TAIL_LINES non-blank lines of a pane (trailing blank screen rows dropped).
+pane_tail() {
+  tmux capture-pane -p -t "$1" 2>/dev/null \
+    | awk 'NF{last=NR} {a[NR]=$0} END{for(i=1;i<=last;i++) print a[i]}' \
+    | tail -n "$TAIL_LINES"
+}
+
+# Echo the target line (contains ALL marks) from a pane's tail, else nothing.
+target_line_of() {
+  local lines m
+  lines="$(pane_tail "$1")"
+  for m in "${MARKS[@]}"; do
+    lines="$(grep -F -- "$m" <<<"$lines")" || return 0
+  done
+  head -n1 <<<"$lines"
+}
+
+# Echo the pane id of the first pane in $SESSION that has a target line.
+find_target_pane() {
+  local id
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    [[ -n "$SELF_PANE" && "$id" == "$SELF_PANE" ]] && continue
+    [[ -n "$(target_line_of "$id")" ]] && { printf '%s\n' "$id"; return 0; }
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}' 2>/dev/null)
+  return 1
+}
+
+# Is $1 still a live pane in the session?
+pane_alive() {
+  tmux list-panes -s -t "$SESSION" -F '#{pane_id}' 2>/dev/null | grep -qxF "$1"
+}
+
+# 0 = blocked, 1 = not blocked, 2 = target line gone.
+# Counts as blocked if "blocked" (case-insensitive) appears on the target line
+# OR the line immediately above OR immediately below it in the pane buffer.
+block_state() {
+  local sep=$'\037' joined verdict
+  joined="$(IFS="$sep"; printf '%s' "${MARKS[*]}")"     # marks joined by US (0x1f)
+  verdict="$(tmux capture-pane -p -t "$1" 2>/dev/null | awk \
+    -v marks="$joined" -v sep="$sep" -v tail="$TAIL_LINES" '
+    BEGIN { nmarks = split(marks, M, sep) }             # M[1..nmarks] = the marks
+    function has_all(s,   k) {                           # does s contain every mark?
+      for (k = 1; k <= nmarks; k++) if (index(s, M[k]) == 0) return 0
+      return 1
+    }
+    { a[NR]=$0; if (NF) last=NR }                        # a[]=lines, last=last non-blank
+    END {
+      if (last == 0) { print "GONE"; exit }
+      start = last - tail + 1; if (start < 1) start = 1  # locate target within last <tail> lines
+      ti = 0
+      for (i = start; i <= last; i++)
+        if (has_all(a[i])) { ti = i; break }
+      if (ti == 0) { print "GONE"; exit }
+      for (j = ti - 1; j <= ti + 1; j++)                 # target line +/- 1 neighbour
+        if (j >= 1 && j <= last && index(tolower(a[j]), "blocked")) { print "BLOCKED"; exit }
+      print "OK"
+    }')"
+  case "$verdict" in
+    BLOCKED) return 0 ;;
+    OK)      return 1 ;;
+    *)       return 2 ;;
+  esac
+}
+
+# Type a literal string, then (after a short pause) press Enter, in a pane.
+# The pause matters: Codex's TUI uses paste-detection, so an Enter sent in the
+# same burst as the text is swallowed as a literal newline instead of submitting
+# the message. Sending Enter as a separate, delayed keypress makes it a real
+# submit. The delay is also applied before typing so the composer is focused.
+send_cmd() {
+  local pane="$1" text="$2"
+  tmux send-keys -t "$pane" -l "$text"
+  sleep "$SEND_DELAY"
+  tmux send-keys -t "$pane" Enter
+}
+
+# Step 4: confirm the block is persistent, then resume-and-recheck until clear.
+# Returns 1 if the pane/line disappears (caller should re-search).
+handle_blocked() {
+  local pane="$1" rc
+  log "blocked detected; waiting ${CONFIRM_WAIT}s to confirm it is persistent"
+  sleep "$CONFIRM_WAIT"
+  pane_alive "$pane" || { log "pane gone during confirm wait"; return 1; }
+  block_state "$pane"; rc=$?
+  (( rc == 2 )) && { log "target line gone during confirm wait"; return 1; }
+  (( rc == 1 )) && { log "block cleared on its own; resuming monitoring"; return 0; }
+
+  while true; do
+    log "still blocked; sending '${RESUME_CMD}' + Enter to ${pane}"
+    send_cmd "$pane" "$RESUME_CMD"
+    sleep "$POST_RESUME_WAIT"
+    pane_alive "$pane" || { log "pane gone after resume"; return 1; }
+    block_state "$pane"; rc=$?
+    (( rc == 2 )) && { log "target line gone after resume"; return 1; }
+    (( rc == 1 )) && { log "block cleared after resume; resuming monitoring"; return 0; }
+
+    log "still blocked ${POST_RESUME_WAIT}s after resume; waiting ${CONFIRM_WAIT}s before retry"
+    sleep "$CONFIRM_WAIT"
+    pane_alive "$pane" || { log "pane gone during retry wait"; return 1; }
+    block_state "$pane"; rc=$?
+    (( rc == 2 )) && { log "target line gone during retry wait"; return 1; }
+    (( rc == 1 )) && { log "block cleared during retry wait; resuming monitoring"; return 0; }
+  done
+}
+
+# Monitor an already-found pane. Returns when the target line is lost so the
+# caller re-searches.
+monitor_pane() {
+  local pane="$1" rc
+  while true; do
+    pane_alive "$pane" || { log "pane ${pane} gone; back to searching"; return; }
+    block_state "$pane"; rc=$?
+    if (( rc == 2 )); then
+      log "target line no longer visible in ${pane}; back to searching"; return
+    elif (( rc == 0 )); then
+      handle_blocked "$pane" || return
+    fi
+    sleep "$CHECK_INTERVAL"
+  done
+}
+
+if (( DRY_RUN )); then
+  pane="$(find_target_pane)" || die "dry-run: no pane in session '$SESSION' has a line with all marks: ${MARKS_DISPLAY}"
+  log "dry-run: target pane = ${pane}"
+  log "dry-run: target line = $(target_line_of "$pane")"
+  log "dry-run: sending '${DRY_CMD}' + Enter"
+  send_cmd "$pane" "$DRY_CMD"
+  log "dry-run: done"
+  exit 0
+fi
+
+log "watching session '$SESSION' for a line containing: ${MARKS_DISPLAY}; resume cmd='$RESUME_CMD'"
+while true; do
+  if pane="$(find_target_pane)"; then
+    log "target pane = ${pane}; target line = $(target_line_of "$pane")"
+    monitor_pane "$pane"
+  else
+    log "no target pane yet; re-searching in ${SEARCH_INTERVAL}s"
+    sleep "$SEARCH_INTERVAL"
+  fi
+done
