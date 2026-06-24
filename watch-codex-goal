@@ -3,14 +3,16 @@
 #
 # It locates the tmux pane whose last few lines contain a status line matching
 # ALL of the given marks (--mark, repeatable), then watches that line. When that
-# line - or the line immediately above or below it - shows "blocked"
-# (case-insensitive) and is still blocked 15 minutes later, it sends
-# "/goal resume" + Enter into the pane and keeps retrying every 15 minutes until
-# the block clears.
+# line - or any line within --block-radius lines above or below it - shows
+# "blocked" (case-insensitive) and is still blocked one --confirm-wait later,
+# it sends "/goal resume" + Enter into the pane and keeps retrying every
+# --confirm-wait until the block clears.
 #
 # Usage:
-#   watch-codex-goal [--session NAME] [--tail N] \
-#                    [--mark STR]... [--dry-run] [-h|--help]
+#   watch-codex-goal [--session NAME] [--tail N] [--mark STR]... \
+#                    [--block-radius N] [--check-interval S] [--confirm-wait S] \
+#                    [--post-resume-wait S] [--search-interval S] \
+#                    [--dry-run] [-h|--help]
 #
 #   --session NAME  tmux session to watch                       (default: youProject)
 #   --tail N        trailing non-blank lines scanned for the marks    (default: 3)
@@ -19,6 +21,13 @@
 #                   values that contain spaces, e.g.:
 #                     --mark gpt --mark "My Mark" --mark 123_123ABC
 #                   If no --mark is given, defaults to: gpt, opt-youProject
+#   --block-radius N  count "blocked" on the target line or any of the N lines
+#                     above/below it (2N+1 lines total)                  (default: 1)
+#   --check-interval S     seconds between normal monitoring polls       (default: 10)
+#   --confirm-wait S       seconds to confirm a block is persistent,
+#                          also the gap between resends                  (default: 30)
+#   --post-resume-wait S   seconds to wait after a resume before re-check (default: 30)
+#   --search-interval S    seconds between retries when no pane is found  (default: 10)
 #   --dry-run   find the target pane, type "continue" + Enter into it, and exit.
 #               A non-destructive check that pane discovery and key-sending work.
 #               (It does NOT look for "blocked".)
@@ -28,33 +37,36 @@
 #   2. Across its panes, find one whose last <tail> (non-blank) lines contain a
 #      line holding ALL marks -> that pane is the target, that line is the
 #      target line.
-#   3. Every 15 minutes, re-read the target line; if it (or the line just above
-#      or below it) contains "blocked", go to step 4.
-#   4. Wait 15 minutes and re-check. If still blocked, send "/goal resume"+Enter,
-#      wait 30s and re-check. While still blocked, wait 15 minutes and resend,
-#      until the block clears.
-#   5. If no target pane/line is found, do nothing and re-search after 1 minute.
+#   3. Every --check-interval, re-read the target line; if it (or any line within
+#      --block-radius lines of it) contains "blocked", go to step 4.
+#   4. Wait --confirm-wait and re-check. If still blocked, send "/goal resume"+
+#      Enter, wait --post-resume-wait and re-check. While still blocked, wait
+#      --confirm-wait and resend, until the block clears.
+#   5. If no target pane/line is found, do nothing and re-search after
+#      --search-interval.
 #
-# Session / tail / marks are set via the flags above (no longer environment vars).
+# Session / tail / marks / intervals are all set via the flags above.
 # Remaining tunables (environment; WCG_ prefix; override mainly for testing):
-#   WCG_CHECK_INTERVAL (900s monitoring poll)
-#   WCG_CONFIRM_WAIT (900s confirm/backoff)   WCG_POST_RESUME_WAIT (30s)
-#   WCG_SEARCH_INTERVAL (60s)  WCG_RESUME_CMD (/goal resume)  WCG_DRY_CMD (continue)
+#   WCG_RESUME_CMD (/goal resume)  WCG_DRY_CMD (continue)
 #   WCG_SEND_DELAY (0.4s pause between typing text and pressing Enter)
 set -uo pipefail
 
-# Defaults for the flag-configurable settings (override with --session / --tail /
-# --mark). Marks are collected into an array during argument parsing below.
+# Defaults for the flag-configurable settings (override with the matching flags).
+# Marks are collected into an array during argument parsing below.
 SESSION="youProject"
 TAIL_LINES="3"
+BLOCK_RADIUS="1"           # check the target line +/- this many lines for "blocked"
 DEFAULT_MARKS=(gpt opt-youProject)
 MARKS=()
 
+# Timing intervals in seconds (override with --check-interval / --confirm-wait /
+# --post-resume-wait / --search-interval).
+CHECK_INTERVAL="10"        # between normal monitoring polls
+CONFIRM_WAIT="30"          # confirm a block is persistent / between resends
+POST_RESUME_WAIT="30"      # settle after a resume before re-checking
+SEARCH_INTERVAL="10"       # retry when nothing found
+
 # Remaining tunables stay as environment variables (WCG_ prefix).
-CHECK_INTERVAL="${WCG_CHECK_INTERVAL:-900}"      # 15 min: normal monitoring poll
-CONFIRM_WAIT="${WCG_CONFIRM_WAIT:-900}"          # 15 min: confirm / between resends
-POST_RESUME_WAIT="${WCG_POST_RESUME_WAIT:-30}"   # 30 s: settle after a resume
-SEARCH_INTERVAL="${WCG_SEARCH_INTERVAL:-60}"     # 1 min: retry when nothing found
 RESUME_CMD="${WCG_RESUME_CMD:-/goal resume}"
 DRY_CMD="${WCG_DRY_CMD:-continue}"
 SEND_DELAY="${WCG_SEND_DELAY:-0.4}"              # pause between typing text and Enter
@@ -69,13 +81,25 @@ usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
 log() { printf '%s [watch-codex-goal] %s\n' "$(date '+%F %T %Z')" "$*"; }
 die() { printf 'watch-codex-goal: %s\n' "$*" >&2; exit 1; }
 
+# Validate a flag value as a non-negative number of seconds (integer or decimal,
+# e.g. 10 or 0.5) suitable for `sleep`. $1 = flag name (for errors), $2 = value.
+valid_seconds() {
+  [[ "$2" =~ ^([0-9]+|[0-9]*\.[0-9]+)$ ]] \
+    || die "$1 must be a non-negative number of seconds (got '$2')"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --session) [[ $# -ge 2 ]] || die "--session needs a value"; SESSION="$2"; shift 2 ;;
-    --tail)    [[ $# -ge 2 ]] || die "--tail needs a value";    TAIL_LINES="$2"; shift 2 ;;
-    --mark)    [[ $# -ge 2 ]] || die "--mark needs a value";    MARKS+=("$2"); shift 2 ;;
-    --dry-run) DRY_RUN=1; shift ;;
-    -h|--help) usage; exit 0 ;;
+    --session)          [[ $# -ge 2 ]] || die "--session needs a value";          SESSION="$2"; shift 2 ;;
+    --tail)             [[ $# -ge 2 ]] || die "--tail needs a value";             TAIL_LINES="$2"; shift 2 ;;
+    --mark)             [[ $# -ge 2 ]] || die "--mark needs a value";             MARKS+=("$2"); shift 2 ;;
+    --block-radius)     [[ $# -ge 2 ]] || die "--block-radius needs a value";     BLOCK_RADIUS="$2"; shift 2 ;;
+    --check-interval)   [[ $# -ge 2 ]] || die "--check-interval needs a value";   CHECK_INTERVAL="$2"; shift 2 ;;
+    --confirm-wait)     [[ $# -ge 2 ]] || die "--confirm-wait needs a value";     CONFIRM_WAIT="$2"; shift 2 ;;
+    --post-resume-wait) [[ $# -ge 2 ]] || die "--post-resume-wait needs a value"; POST_RESUME_WAIT="$2"; shift 2 ;;
+    --search-interval)  [[ $# -ge 2 ]] || die "--search-interval needs a value";  SEARCH_INTERVAL="$2"; shift 2 ;;
+    --dry-run)          DRY_RUN=1; shift ;;
+    -h|--help)          usage; exit 0 ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
 done
@@ -84,6 +108,12 @@ done
 (( ${#MARKS[@]} )) || MARKS=("${DEFAULT_MARKS[@]}")
 
 [[ "$TAIL_LINES" =~ ^[1-9][0-9]*$ ]] || die "--tail must be a positive integer (got '$TAIL_LINES')"
+[[ "$BLOCK_RADIUS" =~ ^[0-9]+$ ]] || die "--block-radius must be a non-negative integer (got '$BLOCK_RADIUS')"
+
+valid_seconds --check-interval   "$CHECK_INTERVAL"
+valid_seconds --confirm-wait     "$CONFIRM_WAIT"
+valid_seconds --post-resume-wait "$POST_RESUME_WAIT"
+valid_seconds --search-interval  "$SEARCH_INTERVAL"
 
 # Human-readable join of the marks for log output, e.g. "gpt + opt-youProject".
 MARKS_DISPLAY="$(printf '%s + ' "${MARKS[@]}")"; MARKS_DISPLAY="${MARKS_DISPLAY% + }"
@@ -125,12 +155,12 @@ pane_alive() {
 
 # 0 = blocked, 1 = not blocked, 2 = target line gone.
 # Counts as blocked if "blocked" (case-insensitive) appears on the target line
-# OR the line immediately above OR immediately below it in the pane buffer.
+# OR on any of the $BLOCK_RADIUS lines above OR below it in the pane buffer.
 block_state() {
   local sep=$'\037' joined verdict
   joined="$(IFS="$sep"; printf '%s' "${MARKS[*]}")"     # marks joined by US (0x1f)
   verdict="$(tmux capture-pane -p -t "$1" 2>/dev/null | awk \
-    -v marks="$joined" -v sep="$sep" -v tail="$TAIL_LINES" '
+    -v marks="$joined" -v sep="$sep" -v tail="$TAIL_LINES" -v radius="$BLOCK_RADIUS" '
     BEGIN { nmarks = split(marks, M, sep) }             # M[1..nmarks] = the marks
     function has_all(s,   k) {                           # does s contain every mark?
       for (k = 1; k <= nmarks; k++) if (index(s, M[k]) == 0) return 0
@@ -144,7 +174,7 @@ block_state() {
       for (i = start; i <= last; i++)
         if (has_all(a[i])) { ti = i; break }
       if (ti == 0) { print "GONE"; exit }
-      for (j = ti - 1; j <= ti + 1; j++)                 # target line +/- 1 neighbour
+      for (j = ti - radius; j <= ti + radius; j++)       # target line +/- radius lines
         if (j >= 1 && j <= last && index(tolower(a[j]), "blocked")) { print "BLOCKED"; exit }
       print "OK"
     }')"
