@@ -78,8 +78,43 @@ SELF_PANE="${WCG_SELF_PANE:-${TMUX_PANE:-}}"
 DRY_RUN=0
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
-log() { printf '%s [watch-codex-goal] %s\n' "$(date '+%F %T %Z')" "$*"; }
 die() { printf 'watch-codex-goal: %s\n' "$*" >&2; exit 1; }
+
+INLINE_LOG_ACTIVE=0
+NO_TARGET_STARTED_AT=""
+
+finish_inline_log() {
+  if (( INLINE_LOG_ACTIVE )); then
+    printf '\n'
+    INLINE_LOG_ACTIVE=0
+  fi
+}
+
+trap finish_inline_log EXIT
+trap 'finish_inline_log; exit 130' INT
+trap 'finish_inline_log; exit 143' TERM
+
+log() {
+  finish_inline_log
+  printf '%s [watch-codex-goal] %s\n' "$(date '+%F %T %Z')" "$*"
+}
+
+log_inline() {
+  printf '\r%s [watch-codex-goal] %s' "$(date '+%F %T %Z')" "$*"
+  INLINE_LOG_ACTIVE=1
+}
+
+current_epoch() {
+  date '+%s'
+}
+
+log_no_target_pane() {
+  local now elapsed
+  now="$(current_epoch)"
+  [[ -n "$NO_TARGET_STARTED_AT" ]] || NO_TARGET_STARTED_AT="$now"
+  elapsed=$((now - NO_TARGET_STARTED_AT))
+  log_inline "no target pane for ${elapsed}s; re-searching in ${SEARCH_INTERVAL}s"
+}
 
 # Validate a flag value as a non-negative number of seconds (integer or decimal,
 # e.g. 10 or 0.5) suitable for `sleep`. $1 = flag name (for errors), $2 = value.
@@ -135,6 +170,10 @@ target_line_of() {
     lines="$(grep -F -- "$m" <<<"$lines")" || return 0
   done
   head -n1 <<<"$lines"
+}
+
+target_line_display() {
+  target_line_of "$1" | awk '{$1=$1; print}'
 }
 
 # Echo the pane id of the first pane in $SESSION that has a target line.
@@ -245,7 +284,7 @@ monitor_pane() {
 if (( DRY_RUN )); then
   pane="$(find_target_pane)" || die "dry-run: no pane in session '$SESSION' has a line with all marks: ${MARKS_DISPLAY}"
   log "dry-run: target pane = ${pane}"
-  log "dry-run: target line = $(target_line_of "$pane")"
+  log "dry-run: target line = $(target_line_display "$pane")"
   log "dry-run: sending '${DRY_CMD}' + Enter"
   send_cmd "$pane" "$DRY_CMD"
   log "dry-run: done"
@@ -255,10 +294,11 @@ fi
 log "watching session '$SESSION' for a line containing: ${MARKS_DISPLAY}; resume cmd='$RESUME_CMD'"
 while true; do
   if pane="$(find_target_pane)"; then
-    log "target pane = ${pane}; target line = $(target_line_of "$pane")"
+    NO_TARGET_STARTED_AT=""
+    log "target pane = ${pane}; target line = $(target_line_display "$pane")"
     monitor_pane "$pane"
   else
-    log "no target pane yet; re-searching in ${SEARCH_INTERVAL}s"
+    log_no_target_pane
     sleep "$SEARCH_INTERVAL"
   fi
 done
