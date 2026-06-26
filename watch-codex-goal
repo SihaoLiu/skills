@@ -172,8 +172,20 @@ target_line_of() {
   head -n1 <<<"$lines"
 }
 
+# Echo the target line for human-readable logs: trim the ends, render runs of
+# three or more whitespace (the status line's column gaps) as " <middle-dot> "
+# so the separation stays visible, and collapse any leftover 2-whitespace run to
+# a single space.
 target_line_display() {
-  target_line_of "$1" | awk '{$1=$1; print}'
+  local sep=" "$'\u00b7'" "              # space + U+00B7 middle dot + space
+  target_line_of "$1" | awk -v sep="$sep" '
+    {
+      sub(/^[[:space:]]+/, "")                         # trim leading whitespace
+      sub(/[[:space:]]+$/, "")                         # trim trailing whitespace
+      gsub(/[[:space:]][[:space:]][[:space:]]+/, sep)  # 3+ whitespace -> " . "
+      gsub(/[[:space:]][[:space:]]/, " ")              # leftover 2 whitespace -> 1 space
+      print
+    }'
 }
 
 # Echo the pane id of the first pane in $SESSION that has a target line.
