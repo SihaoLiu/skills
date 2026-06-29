@@ -6,7 +6,9 @@
 # line - or any line within --block-radius lines above or below it - shows
 # "blocked" (case-insensitive) and is still blocked one --confirm-wait later,
 # it sends "/goal resume" + Enter into the pane and keeps retrying every
-# --confirm-wait until the block clears.
+# --confirm-wait until the block clears. In parallel with normal monitoring, if
+# the pane's last --tail non-blank lines stay byte-for-byte unchanged for one
+# --confirm-wait, it sends "continue" + Enter and starts a fresh snapshot.
 #
 # Usage:
 #   watch-codex-goal [--session NAME] [--tail N] [--mark STR]... \
@@ -48,6 +50,7 @@
 # Session / tail / marks / intervals are all set via the flags above.
 # Remaining tunables (environment; WCG_ prefix; override mainly for testing):
 #   WCG_RESUME_CMD (/goal resume)  WCG_DRY_CMD (continue)
+#   WCG_STALL_CMD (continue)
 #   WCG_SEND_DELAY (0.4s pause between typing text and pressing Enter)
 set -uo pipefail
 
@@ -69,6 +72,7 @@ SEARCH_INTERVAL="10"       # retry when nothing found
 # Remaining tunables stay as environment variables (WCG_ prefix).
 RESUME_CMD="${WCG_RESUME_CMD:-/goal resume}"
 DRY_CMD="${WCG_DRY_CMD:-continue}"
+STALL_CMD="${WCG_STALL_CMD:-continue}"
 SEND_DELAY="${WCG_SEND_DELAY:-0.4}"              # pause between typing text and Enter
 
 # Never monitor the pane this watcher runs in: its own log lines echo the marks,
@@ -106,6 +110,10 @@ log_inline() {
 
 current_epoch() {
   date '+%s'
+}
+
+seconds_at_least() {
+  awk -v elapsed="$1" -v required="$2" 'BEGIN { exit !(elapsed >= required) }'
 }
 
 log_no_target_pane() {
@@ -248,7 +256,7 @@ send_cmd() {
   tmux send-keys -t "$pane" Enter
 }
 
-# Step 4: confirm the block is persistent, then resume-and-recheck until clear.
+# Confirm a persistent block, then resume-and-recheck until clear.
 # Returns 1 if the pane/line disappears (caller should re-search).
 handle_blocked() {
   local pane="$1" rc
@@ -277,6 +285,33 @@ handle_blocked() {
   done
 }
 
+STALL_TAIL_SNAPSHOT=""
+STALL_TAIL_STARTED_AT=""
+
+reset_stall_watch() {
+  STALL_TAIL_SNAPSHOT=""
+  STALL_TAIL_STARTED_AT=""
+}
+
+monitor_tail_stall() {
+  local pane="$1" snapshot now elapsed
+  snapshot="$(pane_tail "$pane")"
+  now="$(current_epoch)"
+
+  if [[ -z "$STALL_TAIL_STARTED_AT" || "$snapshot" != "$STALL_TAIL_SNAPSHOT" ]]; then
+    STALL_TAIL_SNAPSHOT="$snapshot"
+    STALL_TAIL_STARTED_AT="$now"
+    return 0
+  fi
+
+  elapsed=$((now - STALL_TAIL_STARTED_AT))
+  if seconds_at_least "$elapsed" "$CONFIRM_WAIT"; then
+    log "tail unchanged for ${elapsed}s; sending '${STALL_CMD}' + Enter to ${pane}"
+    send_cmd "$pane" "$STALL_CMD"
+    reset_stall_watch
+  fi
+}
+
 # Monitor an already-found pane. Returns when the target line is lost so the
 # caller re-searches.
 monitor_pane() {
@@ -287,7 +322,11 @@ monitor_pane() {
     if (( rc == 2 )); then
       log "target line no longer visible in ${pane}; back to searching"; return
     elif (( rc == 0 )); then
+      reset_stall_watch
       handle_blocked "$pane" || return
+      reset_stall_watch
+    else
+      monitor_tail_stall "$pane"
     fi
     sleep "$CHECK_INTERVAL"
   done
@@ -303,10 +342,11 @@ if (( DRY_RUN )); then
   exit 0
 fi
 
-log "watching session '$SESSION' for a line containing: ${MARKS_DISPLAY}; resume cmd='$RESUME_CMD'"
+log "watching session '$SESSION' for a line containing: ${MARKS_DISPLAY}; resume cmd='$RESUME_CMD'; stall cmd='$STALL_CMD'"
 while true; do
   if pane="$(find_target_pane)"; then
     NO_TARGET_STARTED_AT=""
+    reset_stall_watch
     log "target pane = ${pane}; target line = $(target_line_display "$pane")"
     monitor_pane "$pane"
   else
