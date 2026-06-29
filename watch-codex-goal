@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # watch-codex-goal - keep a Codex "/goal" run in a tmux session unblocked.
 #
-# It locates the tmux pane whose last few lines contain a status line matching
-# ALL of the given marks (--mark, repeatable), then watches that line. When that
-# line - or any line within --block-radius lines above or below it - shows
-# "blocked" (case-insensitive) and is still blocked one --confirm-wait later,
-# it sends "/goal resume" + Enter into the pane and keeps retrying every
-# --confirm-wait until the block clears. In parallel with normal monitoring, if
-# the pane's last --tail non-blank lines stay byte-for-byte unchanged for one
-# --confirm-wait, it sends "continue" + Enter and starts a fresh snapshot.
+# It locates the tmux pane whose recent lines contain a status line matching ALL
+# of the given marks (--mark, repeatable), then watches that line. The recent
+# range is --tail lines ending at the last non-blank line, so trailing blank
+# screen rows are ignored. When that line - or any line within --block-radius
+# lines above or below it - shows "blocked" (case-insensitive) and is still
+# blocked one --confirm-wait later, it sends "/goal resume" + Enter into the
+# pane and keeps retrying every --confirm-wait until the block clears. In
+# parallel with normal monitoring, if that --tail snapshot stays byte-for-byte
+# unchanged for one --confirm-wait, it sends "continue" + Enter and starts a
+# fresh snapshot.
 #
 # Usage:
 #   watch-codex-goal [--session NAME] [--tail N] [--mark STR]... \
@@ -17,7 +19,7 @@
 #                    [--dry-run] [-h|--help]
 #
 #   --session NAME  tmux session to watch                       (default: youProject)
-#   --tail N        trailing non-blank lines scanned for the marks    (default: 3)
+#   --tail N        lines ending at the last non-blank line scanned   (default: 8)
 #   --mark STR      keyword the target status line must contain; pass --mark once
 #                   per keyword - the target line must contain ALL of them. Quote
 #                   values that contain spaces, e.g.:
@@ -36,9 +38,9 @@
 #
 # Behaviour (normal mode):
 #   1. Find the target tmux session (--session, default youProject).
-#   2. Across its panes, find one whose last <tail> (non-blank) lines contain a
-#      line holding ALL marks -> that pane is the target, that line is the
-#      target line.
+#   2. Across its panes, drop trailing blank screen rows, then find one whose
+#      last <tail> lines contain a line holding ALL marks -> that pane is the
+#      target, that line is the target line.
 #   3. If more than one pane matches, log the pane ids and do not send.
 #   4. Every --check-interval, re-read the target line; if it (or any line within
 #      --block-radius lines of it) contains "blocked", go to step 5.
@@ -60,7 +62,7 @@ set -uo pipefail
 # Defaults for the flag-configurable settings (override with the matching flags).
 # Marks are collected into an array during argument parsing below.
 SESSION="youProject"
-TAIL_LINES="3"
+TAIL_LINES="8"
 BLOCK_RADIUS="1"           # check the target line +/- this many lines for "blocked"
 DEFAULT_MARKS=(gpt opt-youProject)
 MARKS=()
@@ -166,7 +168,7 @@ MARKS_DISPLAY="$(printf '%s + ' "${MARKS[@]}")"; MARKS_DISPLAY="${MARKS_DISPLAY%
 
 command -v tmux >/dev/null 2>&1 || die "tmux is not installed"
 
-# Last $TAIL_LINES non-blank lines of a pane (trailing blank screen rows dropped).
+# Last $TAIL_LINES lines of a pane after trailing blank screen rows are dropped.
 pane_tail() {
   tmux capture-pane -p -t "$1" 2>/dev/null \
     | awk 'NF{last=NR} {a[NR]=$0} END{for(i=1;i<=last;i++) print a[i]}' \
