@@ -44,7 +44,9 @@
 #   4. Wait --confirm-wait and re-check. If still blocked, send "/goal resume"+
 #      Enter, wait --post-resume-wait and re-check. While still blocked, wait
 #      --confirm-wait and resend, until the block clears.
-#   5. If no target pane/line is found, do nothing and re-search after
+#   5. If the tail snapshot is unchanged for --confirm-wait and the target is
+#      not blocked, send "continue"+ Enter and start a fresh snapshot.
+#   6. If no target pane/line is found, do nothing and re-search after
 #      --search-interval.
 #
 # Session / tail / marks / intervals are all set via the flags above.
