@@ -39,14 +39,15 @@
 #   2. Across its panes, find one whose last <tail> (non-blank) lines contain a
 #      line holding ALL marks -> that pane is the target, that line is the
 #      target line.
-#   3. Every --check-interval, re-read the target line; if it (or any line within
-#      --block-radius lines of it) contains "blocked", go to step 4.
-#   4. Wait --confirm-wait and re-check. If still blocked, send "/goal resume"+
+#   3. If more than one pane matches, log the pane ids and do not send.
+#   4. Every --check-interval, re-read the target line; if it (or any line within
+#      --block-radius lines of it) contains "blocked", go to step 5.
+#   5. Wait --confirm-wait and re-check. If still blocked, send "/goal resume"+
 #      Enter, wait --post-resume-wait and re-check. While still blocked, wait
 #      --confirm-wait and resend, until the block clears.
-#   5. If the tail snapshot is unchanged for --confirm-wait and the target is
+#   6. If the tail snapshot is unchanged for --confirm-wait and the target is
 #      not blocked, send "continue"+ Enter and start a fresh snapshot.
-#   6. If no target pane/line is found, do nothing and re-search after
+#   7. If no target pane/line is found, do nothing and re-search after
 #      --search-interval.
 #
 # Session / tail / marks / intervals are all set via the flags above.
@@ -198,15 +199,39 @@ target_line_display() {
     }'
 }
 
-# Echo the pane id of the first pane in $SESSION that has a target line.
-find_target_pane() {
+target_panes() {
   local id
   while IFS= read -r id; do
     [[ -n "$id" ]] || continue
     [[ -n "$SELF_PANE" && "$id" == "$SELF_PANE" ]] && continue
-    [[ -n "$(target_line_of "$id")" ]] && { printf '%s\n' "$id"; return 0; }
+    [[ -n "$(target_line_of "$id")" ]] && printf '%s\n' "$id"
   done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id}' 2>/dev/null)
+}
+
+format_pane_list() {
+  awk 'NF { out = out ? out ", " $0 : $0 } END { print out }'
+}
+
+# Echo the pane id if exactly one pane in $SESSION has a target line.
+# Return 1 when none match; return 2 and echo a comma-separated pane list when
+# more than one matches.
+find_target_pane() {
+  local matches count
+  matches="$(target_panes)"
+  count="$(printf '%s\n' "$matches" | awk 'NF { c++ } END { print c + 0 }')"
+  if (( count == 1 )); then
+    printf '%s\n' "$matches"
+    return 0
+  fi
+  if (( count > 1 )); then
+    printf '%s\n' "$(printf '%s\n' "$matches" | format_pane_list)"
+    return 2
+  fi
   return 1
+}
+
+log_multiple_target_panes() {
+  log "multiple target panes matched ($1); not sending"
 }
 
 # Is $1 still a live pane in the session?
@@ -258,6 +283,22 @@ send_cmd() {
   tmux send-keys -t "$pane" Enter
 }
 
+unique_target_pane_still_is() {
+  local pane="$1" found rc
+  found="$(find_target_pane)"; rc=$?
+  if (( rc == 0 )); then
+    [[ "$found" == "$pane" ]] && return 0
+    log "target pane changed from ${pane} to ${found}; not sending"
+    return 1
+  fi
+  if (( rc == 2 )); then
+    log_multiple_target_panes "$found"
+  else
+    log "target pane ${pane} no longer uniquely matched; not sending"
+  fi
+  return 1
+}
+
 # Confirm a persistent block, then resume-and-recheck until clear.
 # Returns 1 if the pane/line disappears (caller should re-search).
 handle_blocked() {
@@ -270,6 +311,7 @@ handle_blocked() {
   (( rc == 1 )) && { log "block cleared on its own; resuming monitoring"; return 0; }
 
   while true; do
+    unique_target_pane_still_is "$pane" || return 1
     log "still blocked; sending '${RESUME_CMD}' + Enter to ${pane}"
     send_cmd "$pane" "$RESUME_CMD"
     sleep "$POST_RESUME_WAIT"
@@ -308,10 +350,12 @@ monitor_tail_stall() {
 
   elapsed=$((now - STALL_TAIL_STARTED_AT))
   if seconds_at_least "$elapsed" "$CONFIRM_WAIT"; then
+    unique_target_pane_still_is "$pane" || return 1
     log "tail unchanged for ${elapsed}s; sending '${STALL_CMD}' + Enter to ${pane}"
     send_cmd "$pane" "$STALL_CMD"
     reset_stall_watch
   fi
+  return 0
 }
 
 # Monitor an already-found pane. Returns when the target line is lost so the
@@ -328,14 +372,16 @@ monitor_pane() {
       handle_blocked "$pane" || return
       reset_stall_watch
     else
-      monitor_tail_stall "$pane"
+      monitor_tail_stall "$pane" || return
     fi
     sleep "$CHECK_INTERVAL"
   done
 }
 
 if (( DRY_RUN )); then
-  pane="$(find_target_pane)" || die "dry-run: no pane in session '$SESSION' has a line with all marks: ${MARKS_DISPLAY}"
+  pane="$(find_target_pane)"; rc=$?
+  (( rc == 2 )) && die "dry-run: multiple target panes matched (${pane}); not sending"
+  (( rc == 0 )) || die "dry-run: no pane in session '$SESSION' has a line with all marks: ${MARKS_DISPLAY}"
   log "dry-run: target pane = ${pane}"
   log "dry-run: target line = $(target_line_display "$pane")"
   log "dry-run: sending '${DRY_CMD}' + Enter"
@@ -346,11 +392,16 @@ fi
 
 log "watching session '$SESSION' for a line containing: ${MARKS_DISPLAY}; resume cmd='$RESUME_CMD'; stall cmd='$STALL_CMD'"
 while true; do
-  if pane="$(find_target_pane)"; then
+  pane="$(find_target_pane)"; rc=$?
+  if (( rc == 0 )); then
     NO_TARGET_STARTED_AT=""
     reset_stall_watch
     log "target pane = ${pane}; target line = $(target_line_display "$pane")"
     monitor_pane "$pane"
+  elif (( rc == 2 )); then
+    NO_TARGET_STARTED_AT=""
+    log_multiple_target_panes "$pane"
+    sleep "$SEARCH_INTERVAL"
   else
     log_no_target_pane
     sleep "$SEARCH_INTERVAL"
