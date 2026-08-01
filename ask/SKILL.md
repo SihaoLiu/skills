@@ -3,7 +3,7 @@ name: ask
 description: >-
   Non-interactive interface to the other coding backends. Runs one prompt
   against a chosen backend through the ask-claude, ask-codex, ask-glm, and
-  ask-kimi wrappers and returns its output as stream-json or text. Use when
+  ask-kimi wrappers and returns backend-native structured output or text. Use when
   delegating a self-contained build or investigation task to another backend,
   collecting an independent review of a design, plan, or diff, asking the same
   question of several backends to compare answers, or resuming an earlier
@@ -31,7 +31,12 @@ on `PATH`.
 Quote the prompt as a single argument. It routinely contains spaces and shell
 metacharacters such as `(`, `)`, `;`, `#`, `*`, and `[`, and an unquoted prompt
 is re-parsed by the shell before the wrapper ever starts. When the prompt is
-long or itself contains quotes, pipe it in on standard input instead.
+multiline or itself contains quotes, pipe it in on standard input instead.
+Claude, GLM, and Codex receive the prompt on stdin regardless of how the wrapper
+collected it, so prompt text cannot collide with backend subcommands or options.
+Kimi keeps the prompt in one command argument, which retains process-list
+visibility and the operating system's single-argument limit. The wrapper
+rejects a Kimi prompt above 131,071 bytes before recording or launch.
 
 ## Arguments
 
@@ -40,7 +45,7 @@ long or itself contains quotes, pipe it in on standard input instead.
 | `PROMPT...` | Prompt text. All positional arguments are joined with spaces. When none are given, the prompt is read from standard input. |
 | `-C`, `--cwd DIR` | Working directory for the backend. Defaults to the current directory and must already exist. |
 | `-S`, `--session ID` | Resume that exact backend session instead of starting a new one. |
-| `--text` | Emit human-readable text. Without it the output is `stream-json`. |
+| `--text` | Emit human-readable text. Without it Claude, GLM, and Kimi emit `stream-json`, while Codex emits JSONL. |
 | `--policy-file FILE` | Prepend an engineering policy to the request. The file must exist and be non-empty. |
 
 ## Backends
@@ -58,30 +63,161 @@ long or itself contains quotes, pipe it in on standard input instead.
 itself. It is delivered as a system-level instruction where the backend supports
 one, and otherwise prepended to the prompt above a `# Task` heading. Use it to
 state invariants the backend must respect; keep the prompt itself about the work
-to be done.
+to be done. Claude, GLM, and Kimi read policy files with bounded memory and
+reject the request when the normalized, trimmed content exceeds 131,071 bytes.
+Claude and GLM then pass the policy in one harness argument. Kimi applies its
+existing command-argument limit to the combined policy and prompt. Codex
+transports the combined policy and prompt on stdin and has no command-argument
+policy limit.
 
 ## Output and exit status
 
-The wrapper replaces itself with the backend process, so the exit status is the
-backend's own, except for two cases it reports itself:
+The wrapper runs the backend as a child process and mirrors both streams
+through unchanged, so `stdout` stays the data channel. The exit status is the
+backend's own, and a backend killed by signal N reports as `128 + N`. Three cases
+the wrapper reports itself:
 
 | Exit code | Meaning |
 | --- | --- |
-| 2 | Invalid request: empty prompt, missing working directory, unreadable or empty policy file, unknown backend, or a malformed Z.AI key. |
-| 126 | The backend program is not installed or could not be executed. |
+| 2 | Invalid request: empty prompt, missing working directory, unreadable, empty, or oversized policy file, unknown backend, a malformed Z.AI key, or a Kimi prompt above the command-argument limit. |
+| 126 | The backend program is not on `PATH`, could not be executed or safely supervised, or an output destination fails for a reason other than a closed pipe. |
+| 130 | The wrapper receives `SIGINT` before backend signal forwarding is active. |
+
+If the POSIX watchdog cannot start, the backend is not launched. This is a
+runtime supervision failure, so a record created after request validation may
+still contain the exit status and diagnostic.
+
+If a signal cannot be forwarded while the backend is starting, the wrapper
+reports `128 + N` for that signal. A signal observed after the backend leader
+has already exited is late and does not replace the backend's status.
+
+If the caller closes an output pipe, the wrapper closes the corresponding
+backend pipe and forwards `SIGPIPE`. A backend that handles `SIGPIPE` keeps its
+own exit status. If the backend has already exited and cannot receive the
+signal, an otherwise successful run reports `128 + SIGPIPE` (normally 141);
+an existing nonzero backend status remains authoritative.
+
+The backend writes to pipes rather than to a terminal, so it drops colour and
+progress rendering -- which is what the non-interactive output formats are for.
+A backend that only line-buffers on a terminal may deliver `--text` output in
+larger blocks.
+
+The wrapper's own diagnostics, the record path and any warnings, go to stderr
+and are never mixed into the recorded backend streams.
+
+The wrapper forwards `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT` to the
+backend's original process group, except for dispositions inherited as
+ignored. After a forwarded signal, only caller output backpressure already
+present or first observed during a fixed eligibility window tied to that signal
+can trigger abandonment. Eligible output must remain continuously blocked for a
+full grace period from the later of signal delivery or the start of
+backpressure. Partial writes count as output progress. Progress during the
+eligibility window restarts the continuous stall timer, while progress after the
+eligibility window disarms that signal because its output was not continuously
+blocked. Output that resumes, or first blocks after the eligibility window,
+cannot be abandoned by that signal. A later signal cannot postpone an already
+armed stall deadline; later signals otherwise have their own eligibility. When
+the continuous grace expires, the wrapper abandons that output and terminates
+the backend group before waiting. Once the backend leader exits, the wrapper
+closes its input, terminates its supervised group, and drains remaining stream
+data for at most two seconds. It keeps observing the leader even if every output
+descriptor closed earlier, including on POSIX systems where observing the leader
+also reaps it. A descendant that creates a new process group or session is
+outside this ownership boundary; its later output is cut off when the drain
+deadline expires. Other job-control signals are not relayed.
 
 Read the output before acting on it. A backend that answers confidently can
 still be wrong about this repository, so verify claims against the working tree
 rather than relaying them.
 
+## Records
+
+Argument, working-directory, policy-file, and credential validation happens
+before recording; those validation failures emit a diagnostic without creating
+a record. After validation, each invocation is recorded under `~/.ask-ai`, one
+directory per run:
+
+```text
+~/.ask-ai/<harness>/<model>/<YYYYMMDD>/<HHMMSS>-<random>/
+```
+
+`<harness>` is the selected backend program, so `ask-glm` records under
+`claude/glm-5.2-1m` and `ask-claude` under `claude/claude-opus-5-1m`. The
+wrapper prints the directory to stderr as the run starts.
+
+| File | Contents |
+| --- | --- |
+| `config.toml` | The request, the command and its observed resolved target, the environment the wrapper changed, and a `[result]` table appended when the run ends. |
+| `prompt.md` | The prompt exactly as delivered to the backend. `ask-codex` and `ask-kimi` carry the policy inside it, `ask-claude` and `ask-glm` pass the policy separately, and `policy_inlined` records which happened. |
+| `stdout`, `stderr` | The backend's own bytes, verbatim and unreformatted, in the selected backend-native output format. |
+| `reproduce.cmd` | An executable `/bin/sh` script that re-runs the same invocation: the observed program path, every argument expanded and quoted, the working directory, and the environment changes. |
+
+`[request].prompt_from_stdin` says whether the wrapper consumed standard input
+through EOF to obtain the prompt. For Claude, GLM, and Codex, `reproduce.cmd`
+redirects `prompt.md` to backend stdin, matching the live transport. Kimi keeps
+the prompt in its command argument; when the wrapper originally consumed stdin,
+its replay redirects backend stdin from `/dev/null` to preserve EOF. With a
+positional Kimi prompt, the backend inherits the caller's stdin. Those additional
+input bytes are not recorded, so a replay that depends on them must provide them
+again.
+
+For a backend found on `PATH`, `[command].executable` is the stable absolute
+launcher used by both the original run and `reproduce.cmd`.
+`[command].resolved_executable` is the target observed through that launcher
+before the run; it is forensic context, not an inode lock. If the launcher
+changes later, replay may select a newer installed version while the record
+still shows which target was observed originally. When lookup fails, the
+record retains the bare harness name, omits `resolved_executable`, and a later
+replay performs a fresh `PATH` lookup.
+
+GLM replay embeds the absolute interpreter, validator module, and key-file paths
+observed when the record is created. The validator also depends on its sibling
+modules in the same skill directory. Moving or removing any of those files can
+make that replay unusable even when the backend launcher remains available.
+
+Backends report their session ID in their own output, so a record is also where
+to recover an ID for a later `-S` resume.
+
+A record holds the delivered prompt and raw backend streams. Those files are
+not inspected or redacted and may contain secrets supplied by the prompt or
+printed by the backend. The record root and each run directory are mode `0700`;
+its data files are mode `0600`, and `reproduce.cmd` is mode `0700`. A
+pre-existing record root must already have mode `0700`; the wrapper will not
+change the permissions of an arbitrary `ASK_AI_HOME` or follow one that is a
+symbolic link. The parent path must be trusted while the wrapper initially
+creates or opens the record root. Once open, directory and file creation stays
+anchored to verified directory descriptors, so later path replacement cannot
+redirect recorded data. The wrapper-managed Z.AI key is shown as `<redacted>`
+in `config.toml`, and `reproduce.cmd` re-reads it from its key file instead of
+embedding it.
+
+Set `ASK_AI_HOME` to record somewhere else. Recording is secondary to running:
+when a record artifact cannot be written the wrapper warns on stderr and runs
+the backend anyway, so the affected record may be incomplete. Normal record
+writes enter a bounded FIFO in order, so an in-flight write does not suppress
+later chunks or permit unbounded memory growth. If the FIFO cannot make progress
+within its fixed wait, or record closing sees no progress for a fixed no-progress
+grace, the wrapper stops recording that stream, warns once, and continues
+mirroring backend output to the caller. The closing deadline restarts after each
+accepted chunk completes, preserving a healthy queue tail; the bounded FIFO
+keeps the total shutdown wait finite. In other words, if record storage blocks,
+backend execution and caller output remain authoritative.
+Records are not pruned or size-limited; choose a location with enough capacity
+and manage its retention explicitly.
+
 ## Credentials
 
 `ask-glm` reads the Z.AI key from `$PERSONAL_SECRET_PATH/zai.key` at invocation
-time. The file must contain only a key in `{key-id}.{secret}` form. The key
+time. The file must contain one key in `{key-id}.{secret}` form, with at most
+one trailing LF and no other whitespace or control characters. The key
 reaches the child process through its environment, never through command
-arguments, and is never written to persistent configuration. The wrapper also
-clears inherited Claude authentication variables from that child environment so
-the session cannot fall back to the wrong provider.
+arguments. The wrapper does not serialize it into persistent configuration or
+the replay script. Replay disables shell tracing before loading the key and
+uses the same validator as the original invocation. A backend can still print
+environment values, and its raw output is recorded as described above. The
+wrapper also clears inherited provider selectors, authentication, model, and
+custom-header overrides from that child environment so the session cannot fall
+back to the wrong provider.
 
 ## Scope
 
