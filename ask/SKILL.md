@@ -3,14 +3,14 @@ name: ask
 description: >-
   Non-interactive interface to the other coding backends. Runs one prompt
   against a chosen backend through the ask-claude, ask-codex, ask-glm, and
-  ask-kimi wrappers and returns backend-native structured output or text. Use when
+  ask-kimi wrappers and separates the final response from its execution transcript. Use when
   delegating a self-contained build or investigation task to another backend,
   collecting an independent review of a design, plan, or diff, asking the same
   question of several backends to compare answers, or resuming an earlier
   backend session by ID. Triggers on "ask codex", "ask kimi", "ask glm",
   "ask claude", "get a second opinion from another model", or any request to
   hand work to a different coding backend without an interactive session.
-argument-hint: '<backend> [-C DIR] [-S SESSION_ID] [--text] [--policy-file FILE] <prompt>'
+argument-hint: '<backend> [-C DIR] [-S SESSION_ID] [--text] [--progress stderr|off] [--policy-file FILE] <prompt>'
 user-invocable: true
 ---
 
@@ -25,7 +25,8 @@ on `PATH`.
 
 ```text
 <skill directory>/ask-<backend> [-C DIR] [-S SESSION_ID] [--text]
-                                [--policy-file FILE] [PROMPT...]
+                                [--progress stderr|off] [--policy-file FILE]
+                                [PROMPT...]
 ```
 
 Quote the prompt as a single argument. It routinely contains spaces and shell
@@ -45,7 +46,8 @@ rejects a Kimi prompt above 131,071 bytes before recording or launch.
 | `PROMPT...` | Prompt text. All positional arguments are joined with spaces. When none are given, the prompt is read from standard input. |
 | `-C`, `--cwd DIR` | Working directory for the backend. Defaults to the current directory and must already exist. |
 | `-S`, `--session ID` | Resume that exact backend session instead of starting a new one. |
-| `--text` | Emit human-readable text. Without it Claude, GLM, and Kimi emit `stream-json`, while Codex emits JSONL. |
+| `--text` | Compatibility passthrough mode that requests backend-native text output. Default mode already emits a human-readable final answer and also provides a structured transcript. |
+| `--progress stderr\|off` | Send the backend's structured event transcript to stderr. This defaults to `stderr`; `off` discards those events while retaining the final answer and native diagnostics. |
 | `--policy-file FILE` | Prepend an engineering policy to the request. The file must exist and be non-empty. |
 
 ## Backends
@@ -72,10 +74,27 @@ policy limit.
 
 ## Output and exit status
 
-The wrapper runs the backend as a child process and mirrors both streams
-through unchanged, so `stdout` stays the data channel. The exit status is the
-backend's own, and a backend killed by signal N reports as `128 + N`. Three cases
-the wrapper reports itself:
+By default, the wrapper requests each backend's structured event format as an
+internal transport. stdout contains only the final answer as human-readable
+text. The wrapper selects Claude and GLM's final `result`, Codex's last completed
+`agent_message`, or Kimi's last assistant message, then writes it when the
+backend closes its event stream.
+
+stderr carries the structured event transcript as it arrives, followed or
+interleaved with any backend-native and wrapper diagnostics. This preserves the
+reasoning summaries, counters, tool calls, tool results, subagent messages, and
+other process details that the backend chooses to expose. Claude and GLM request
+`--include-partial-messages` and `--forward-subagent-text` so incremental and
+subagent events are included. `--progress off` suppresses only the structured
+event transcript.
+
+`--text` is a compatibility passthrough mode. It asks the backend for direct
+text output and mirrors the backend streams, so it may not provide a process
+transcript. The default mode should be preferred for both a readable result and
+a replayable transcript.
+
+The exit status is the backend's own, and a backend killed by signal N reports
+as `128 + N`. Three cases the wrapper reports itself:
 
 | Exit code | Meaning |
 | --- | --- |
@@ -98,12 +117,12 @@ signal, an otherwise successful run reports `128 + SIGPIPE` (normally 141);
 an existing nonzero backend status remains authoritative.
 
 The backend writes to pipes rather than to a terminal, so it drops colour and
-progress rendering -- which is what the non-interactive output formats are for.
-A backend that only line-buffers on a terminal may deliver `--text` output in
+terminal progress rendering. Default mode uses structured events instead. A
+backend that only line-buffers on a terminal may deliver `--text` output in
 larger blocks.
 
 The wrapper's own diagnostics, the record path and any warnings, go to stderr
-and are never mixed into the recorded backend streams.
+and are never mixed into the recorded display streams.
 
 The wrapper forwards `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT` to the
 backend's original process group, except for dispositions inherited as
@@ -149,7 +168,7 @@ wrapper prints the directory to stderr as the run starts.
 | --- | --- |
 | `config.toml` | The request, the command and its observed resolved target, the environment the wrapper changed, and a `[result]` table appended when the run ends. |
 | `prompt.md` | The prompt exactly as delivered to the backend. `ask-codex` and `ask-kimi` carry the policy inside it, `ask-claude` and `ask-glm` pass the policy separately, and `policy_inlined` records which happened. |
-| `stdout`, `stderr` | The backend's own bytes, verbatim and unreformatted, in the selected backend-native output format. |
+| `stdout`, `stderr` | The displayed final answer and process transcript. The recorded `stdout` and `stderr` match the corresponding caller streams except for wrapper-only diagnostics such as the record path and storage warnings. |
 | `reproduce.cmd` | An executable `/bin/sh` script that re-runs the same invocation: the observed program path, every argument expanded and quoted, the working directory, and the environment changes. |
 
 `[request].prompt_from_stdin` says whether the wrapper consumed standard input
@@ -175,12 +194,13 @@ observed when the record is created. The validator also depends on its sibling
 modules in the same skill directory. Moving or removing any of those files can
 make that replay unusable even when the backend launcher remains available.
 
-Backends report their session ID in their own output, so a record is also where
-to recover an ID for a later `-S` resume.
+Backends report their session ID in structured events, so the recorded stderr
+transcript is also where to recover an ID for a later `-S` resume.
 
-A record holds the delivered prompt and raw backend streams. Those files are
-not inspected or redacted and may contain secrets supplied by the prompt or
-printed by the backend. The record root and each run directory are mode `0700`;
+A record holds the delivered prompt, displayed final answer, and process
+transcript. Those files are not inspected or redacted and may contain secrets
+supplied by the prompt or printed by the backend. The record root and each run
+directory are mode `0700`;
 its data files are mode `0600`, and `reproduce.cmd` is mode `0700`. A
 pre-existing record root must already have mode `0700`; the wrapper will not
 change the permissions of an arbitrary `ASK_AI_HOME` or follow one that is a
@@ -214,7 +234,7 @@ reaches the child process through its environment, never through command
 arguments. The wrapper does not serialize it into persistent configuration or
 the replay script. Replay disables shell tracing before loading the key and
 uses the same validator as the original invocation. A backend can still print
-environment values, and its raw output is recorded as described above. The
+environment values, and its displayed output is recorded as described above. The
 wrapper also clears inherited provider selectors, authentication, model, and
 custom-header overrides from that child environment so the session cannot fall
 back to the wrong provider.

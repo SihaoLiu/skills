@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import argparse
 import errno
 import functools
 import hashlib
@@ -17,14 +16,16 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, BinaryIO, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, TextIO, Tuple, cast
+from typing import Any, BinaryIO, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple, cast
 
+from ask_request import InvocationError, MAX_ARGUMENT_BYTES, Request, parse_request
 from ask_stream import (
     _OutputWriter,
     _RecordWriter,
     _SignalOutputGrace,
     _StreamResult,
 )
+from ask_progress import StructuredOutput
 from ask_watchdog import (
     WATCHDOG_KILL_COMMAND,
     WATCHDOG_TERMINATE_COMMAND,
@@ -51,7 +52,6 @@ STREAM_CHUNK_BYTES = 65536
 STREAM_SELECT_SECONDS = 0.05
 STREAM_DRAIN_GRACE_SECONDS = 2.0
 SIGNAL_OUTPUT_GRACE_SECONDS = 0.5
-MAX_ARGUMENT_BYTES = 131071
 FORWARDED_SIGNALS = (
     signal.SIGINT,
     signal.SIGTERM,
@@ -62,10 +62,6 @@ _NONREAPING_WAIT_SUPPORTED = os.name == "posix" and all(
     hasattr(os, name)
     for name in ("P_PID", "WEXITED", "WNOHANG", "WNOWAIT", "waitid")
 )
-
-
-class InvocationError(RuntimeError):
-    pass
 
 
 class EnvironmentAssignment(NamedTuple):
@@ -107,205 +103,6 @@ class Invocation(NamedTuple):
     stdin: Optional[bytes] = None
 
 
-class Request(NamedTuple):
-    cwd: Path
-    session_id: Optional[str]
-    text_output: bool
-    policy_file: Optional[str]
-    policy_text: Optional[str]
-    argv: Tuple[str, ...]
-    prompt: str
-    prompt_from_stdin: bool
-
-
-def _read_bounded_policy_text(
-    policy_file: TextIO,
-    maximum_bytes: int,
-    path: Path,
-) -> str:
-    content: List[str] = []
-    content_bytes = 0
-    pending_whitespace: List[str] = []
-    pending_bytes = 0
-    pending_overflow = False
-
-    while True:
-        chunk = policy_file.read(65536)
-        if not chunk:
-            return "".join(content)
-        for character in chunk:
-            character_bytes = len(character.encode("utf-8"))
-            if character.isspace():
-                if content and not pending_overflow:
-                    if (
-                        content_bytes + pending_bytes + character_bytes
-                        <= maximum_bytes
-                    ):
-                        pending_whitespace.append(character)
-                        pending_bytes += character_bytes
-                    else:
-                        pending_overflow = True
-                continue
-            if (
-                pending_overflow
-                or content_bytes + pending_bytes + character_bytes > maximum_bytes
-            ):
-                raise InvocationError(
-                    "policy is too large for a command argument: {}".format(path)
-                )
-            content.extend(pending_whitespace)
-            content.append(character)
-            content_bytes += pending_bytes + character_bytes
-            pending_whitespace.clear()
-            pending_bytes = 0
-
-
-def _read_policy(
-    path_text: Optional[str],
-    maximum_bytes: Optional[int] = None,
-) -> Optional[str]:
-    if path_text is None:
-        return None
-    try:
-        path = Path(path_text).expanduser()
-    except (OSError, RuntimeError) as error:
-        raise InvocationError(
-            "cannot resolve policy file {}: {}".format(path_text, error)
-        ) from error
-    try:
-        with path.open("r", encoding="utf-8") as policy_file:
-            if maximum_bytes is None:
-                policy = policy_file.read().strip()
-            else:
-                policy = _read_bounded_policy_text(
-                    policy_file,
-                    maximum_bytes,
-                    path,
-                )
-    except (OSError, UnicodeError) as error:
-        raise InvocationError("cannot read policy file {}: {}".format(path, error))
-    if not policy:
-        raise InvocationError("policy file is empty: {}".format(path))
-    if "\x00" in policy:
-        raise InvocationError("policy file contains NUL: {}".format(path))
-    return policy
-
-
-def _request_argv(arguments: Sequence[str]) -> Tuple[str, ...]:
-    value_options = ("--cwd", "--session", "--policy-file")
-    flag_options = ("--text",)
-    result: List[str] = []
-    index = 0
-    options_enabled = True
-
-    while index < len(arguments):
-        argument = arguments[index]
-        if options_enabled and argument == "--":
-            result.append(argument)
-            options_enabled = False
-            index += 1
-            continue
-        if not options_enabled:
-            index += 1
-            continue
-        if argument in ("-C", "-S"):
-            result.extend(arguments[index : index + 2])
-            index += 2
-            continue
-        if (argument.startswith("-C") or argument.startswith("-S")) and len(argument) > 2:
-            result.append(argument)
-            index += 1
-            continue
-        if argument.startswith("--"):
-            name, separator, _value = argument.partition("=")
-            matches = [
-                option
-                for option in value_options + flag_options
-                if option.startswith(name)
-            ]
-            if len(matches) == 1:
-                result.append(argument)
-                if matches[0] in value_options and not separator:
-                    result.extend(arguments[index + 1 : index + 2])
-                    index += 2
-                else:
-                    index += 1
-                continue
-        index += 1
-
-    return tuple(result)
-
-
-def parse_request(
-    backend: str,
-    argv: Optional[Sequence[str]] = None,
-    stdin: TextIO = sys.stdin,
-) -> Request:
-    parser = argparse.ArgumentParser(
-        prog="ask-{}".format(backend),
-        description="Run the {} coding backend non-interactively.".format(backend),
-    )
-    parser.add_argument(
-        "-C",
-        "--cwd",
-        default=str(Path.cwd()),
-        help="working directory for the coding backend (default: current directory)",
-    )
-    parser.add_argument(
-        "-S",
-        "--session",
-        dest="session_id",
-        help="resume an exact backend session ID",
-    )
-    parser.add_argument(
-        "--text",
-        action="store_true",
-        help="emit human-readable text instead of stream-json",
-    )
-    parser.add_argument(
-        "--policy-file",
-        help="inject an engineering policy file into the request",
-    )
-    parser.add_argument("prompt", nargs="*", help="prompt text; reads stdin when omitted")
-    arguments = tuple(sys.argv[1:] if argv is None else argv)
-    args = parser.parse_args(arguments)
-
-    prompt_from_stdin = not args.prompt
-    if prompt_from_stdin:
-        binary_stdin = getattr(stdin, "buffer", None)
-        if binary_stdin is None:
-            prompt = stdin.read().strip()
-        else:
-            prompt = binary_stdin.read().decode("utf-8", "surrogateescape").strip()
-    else:
-        prompt = " ".join(args.prompt).strip()
-    if not prompt:
-        raise InvocationError("prompt must be provided as arguments or stdin")
-    if "\x00" in prompt:
-        raise InvocationError("prompt cannot contain NUL")
-
-    try:
-        cwd = Path(args.cwd).expanduser().resolve()
-    except (OSError, RuntimeError) as error:
-        raise InvocationError(
-            "cannot resolve working directory {}: {}".format(args.cwd, error)
-        ) from error
-
-    return Request(
-        cwd=cwd,
-        session_id=args.session_id,
-        text_output=args.text,
-        policy_file=args.policy_file,
-        policy_text=_read_policy(
-            args.policy_file,
-            MAX_ARGUMENT_BYTES if backend in ("claude", "glm", "kimi") else None,
-        ),
-        argv=_request_argv(arguments),
-        prompt=prompt,
-        prompt_from_stdin=prompt_from_stdin,
-    )
-
-
 def _claude_command(
     model: str,
     session_id: Optional[str],
@@ -328,6 +125,10 @@ def _claude_command(
             "--verbose",
         ]
     )
+    if not text_output:
+        command.extend(
+            ["--include-partial-messages", "--forward-subagent-text"]
+        )
     if policy_text:
         command.extend(["--append-system-prompt", policy_text])
     return command
@@ -762,6 +563,7 @@ def _configuration_document(
         "started_at = {}".format(_toml_string(started_at.isoformat(timespec="seconds"))),
         "cwd = {}".format(_toml_string(str(request.cwd))),
         "text_output = {}".format(_toml_bool(request.text_output)),
+        "progress_output = {}".format(_toml_bool(request.progress_output)),
     ]
     if request.session_id:
         lines.append("session_id = {}".format(_toml_string(request.session_id)))
@@ -1305,6 +1107,7 @@ def _stream(
     relay: Optional[_SignalRelay] = None,
     stdin_payload: Optional[bytes] = None,
     watchdog: Optional[Watchdog] = None,
+    structured_output: Optional[StructuredOutput] = None,
 ) -> _StreamResult:
     remaining_logs: Dict[str, BinaryIO] = {}
     record_writers: Dict[str, _RecordWriter] = {}
@@ -1341,6 +1144,11 @@ def _stream(
     input_offset = 0
     input_open = input_stream is not None
 
+    def output_destination(name: str) -> Optional[str]:
+        if name == "stdout" and structured_output is not None:
+            return "stderr" if structured_output.transcript_output else None
+        return name
+
     def unregister(file_object) -> None:
         try:
             selector.unregister(file_object)
@@ -1348,7 +1156,12 @@ def _stream(
             pass
 
     def register_backend(name: str) -> None:
-        if backend_open[name] and not backend_registered[name]:
+        destination = output_destination(name)
+        if (
+            backend_open[name]
+            and not backend_registered[name]
+            and (destination is None or not pending[destination])
+        ):
             stream = backend_streams[name]
             selector.register(stream, selectors.EVENT_READ, ("backend", name))
             backend_registered[name] = True
@@ -1393,7 +1206,9 @@ def _stream(
         nonlocal sigpipe_delivered, unforwarded_sigpipe
         unregister_writer(name)
         pending[name] = False
-        close_backend(name)
+        for source in backend_streams:
+            if output_destination(source) == name:
+                close_backend(source)
         if sigpipe_delivered:
             return
         sigpipe_delivered = True
@@ -1414,7 +1229,24 @@ def _stream(
             return
         unregister_writer(name)
         pending[name] = False
-        register_backend(name)
+        for source in backend_streams:
+            register_backend(source)
+
+    def submit_output(name: str, content: bytes) -> None:
+        if not content:
+            return
+        if pending[name]:
+            raise RuntimeError("{} writer already has pending output".format(name))
+        for source in backend_streams:
+            if output_destination(source) == name and backend_registered[source]:
+                unregister(backend_streams[source])
+                backend_registered[source] = False
+        record_writer = record_writers.get(name)
+        if record_writer is not None and not record_writer.submit(content):
+            record_writers.pop(name, None)
+        pending[name] = True
+        writers[name].submit(content)
+        register_writer(name)
 
     def abandon_backpressured_output() -> None:
         for name in ("stdout", "stderr"):
@@ -1519,18 +1351,19 @@ def _stream(
                         close_input()
                     continue
 
+                if not backend_registered[name]:
+                    continue
                 chunk = os.read(key.fd, STREAM_CHUNK_BYTES)
                 if not chunk:
                     close_backend(name)
+                    if name == "stdout" and structured_output is not None:
+                        submit_output("stdout", structured_output.finish())
                     continue
-                record_writer = record_writers.get(name)
-                if record_writer is not None and not record_writer.submit(chunk):
-                    record_writers.pop(name, None)
-                unregister(backend_streams[name])
-                backend_registered[name] = False
-                pending[name] = True
-                writers[name].submit(chunk)
-                register_writer(name)
+                if name == "stdout" and structured_output is not None:
+                    structured_output.feed(chunk)
+                destination = output_destination(name)
+                if destination is not None:
+                    submit_output(destination, chunk)
 
             if signal_interrupted_backpressure():
                 terminate_backend = True
@@ -1574,8 +1407,9 @@ def _execute(
     environment: Mapping[str, str],
     cwd: Path,
     directory: Optional[RecordDirectory],
+    structured_output: Optional[StructuredOutput] = None,
 ) -> int:
-    """Run the backend, mirroring both streams to the caller and to the record.
+    """Run the backend and write its displayed streams to the caller and record.
 
     Returns the raw wait status: negative when the backend died from a signal.
     """
@@ -1648,6 +1482,7 @@ def _execute(
                 relay,
                 invocation.stdin,
                 watchdog,
+                structured_output,
             )
             if stream_result.terminate_backend:
                 killed_by_watchdog = _stop_watchdog(watchdog)
@@ -1745,6 +1580,11 @@ def main(backend: str, argv: Optional[Sequence[str]] = None) -> int:
             environment=child_environment,
             cwd=request.cwd,
             directory=directory,
+            structured_output=(
+                StructuredOutput(backend, request.progress_output)
+                if not request.text_output
+                else None
+            ),
         )
     except KeyboardInterrupt:
         exit_code = 128 + int(signal.SIGINT)
