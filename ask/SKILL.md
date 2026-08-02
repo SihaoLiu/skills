@@ -46,8 +46,8 @@ rejects a Kimi prompt above 131,071 bytes before recording or launch.
 | `PROMPT...` | Prompt text. All positional arguments are joined with spaces. When none are given, the prompt is read from standard input. |
 | `-C`, `--cwd DIR` | Working directory for the backend. Defaults to the current directory and must already exist. |
 | `-S`, `--session ID` | Resume that exact backend session instead of starting a new one. |
-| `--text` | Compatibility passthrough mode that requests backend-native text output. Default mode already emits a human-readable final answer and also provides a structured transcript. |
-| `--progress stderr\|off` | Send the backend's structured event transcript to stderr. This defaults to `stderr`; `off` discards those events while retaining the final answer and native diagnostics. |
+| `--text` | Compatibility mode that requests backend-native text on stdout. Default mode already emits a human-readable final answer and also provides a structured transcript. |
+| `--progress stderr\|off` | Record the backend's structured event transcript in the run's `stderr` file. This defaults to `stderr`; `off` discards those events while retaining the final answer and native diagnostics. |
 | `--policy-file FILE` | Prepend an engineering policy to the request. The file must exist and be non-empty. |
 
 ## Backends
@@ -80,18 +80,21 @@ text. The wrapper selects Claude and GLM's final `result`, Codex's last complete
 `agent_message`, or Kimi's last assistant message, then writes it when the
 backend closes its event stream.
 
-stderr carries the structured event transcript as it arrives, followed or
-interleaved with any backend-native and wrapper diagnostics. This preserves the
-reasoning summaries, counters, tool calls, tool results, subagent messages, and
-other process details that the backend chooses to expose. Claude and GLM request
-`--include-partial-messages` and `--forward-subagent-text` so incremental and
-subagent events are included. `--progress off` suppresses only the structured
-event transcript.
+In every mode, caller stderr receives one early hint naming the exact recorded
+`stderr` file.
+The backend's structured event transcript and native diagnostics are written
+only to the recorded `stderr`; they are not replayed to the caller. This
+preserves reasoning summaries, counters, tool calls, tool results, subagent
+messages, and other process details without adding them to the caller's
+context. Claude and GLM request `--include-partial-messages` and
+`--forward-subagent-text` so incremental and subagent events are included.
+`--progress off` suppresses only the structured event transcript. Wrapper
+warnings and errors remain visible on caller stderr.
 
-`--text` is a compatibility passthrough mode. It asks the backend for direct
-text output and mirrors the backend streams, so it may not provide a process
-transcript. The default mode should be preferred for both a readable result and
-a replayable transcript.
+`--text` keeps backend stdout as a compatibility passthrough; backend stderr
+remains record-only, and native text mode may not provide a process transcript.
+The default mode should be preferred for both a readable result and a
+replayable transcript.
 
 The exit status is the backend's own, and a backend killed by signal N reports
 as `128 + N`. Three cases the wrapper reports itself:
@@ -110,19 +113,25 @@ If a signal cannot be forwarded while the backend is starting, the wrapper
 reports `128 + N` for that signal. A signal observed after the backend leader
 has already exited is late and does not replace the backend's status.
 
-If the caller closes an output pipe, the wrapper closes the corresponding
-backend pipe and forwards `SIGPIPE`. A backend that handles `SIGPIPE` keeps its
-own exit status. If the backend has already exited and cannot receive the
-signal, an otherwise successful run reports `128 + SIGPIPE` (normally 141);
-an existing nonzero backend status remains authoritative.
+In `--text` mode, if the caller closes stdout, the wrapper closes the backend
+stdout pipe and forwards `SIGPIPE`. Default mode discovers a closed caller
+stdout when it delivers the final answer and likewise forwards `SIGPIPE`. A
+backend that handles `SIGPIPE` keeps its own exit status. If the backend has
+already exited and cannot receive the signal, an otherwise successful run
+reports `128 + SIGPIPE` (normally 141); an existing nonzero backend status
+remains authoritative.
 
 The backend writes to pipes rather than to a terminal, so it drops colour and
 terminal progress rendering. Default mode uses structured events instead. A
 backend that only line-buffers on a terminal may deliver `--text` output in
 larger blocks.
 
-The wrapper's own diagnostics, the record path and any warnings, go to stderr
-and are never mixed into the recorded display streams.
+The wrapper's startup hint and any warnings go to caller stderr and are never
+mixed into the recorded backend streams. A normal startup hint has this form:
+
+```text
+Hint: please check <record-directory>/stderr for in-progress output.
+```
 
 The wrapper forwards `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT` to the
 backend's original process group, except for dispositions inherited as
@@ -162,13 +171,14 @@ directory per run:
 
 `<harness>` is the selected backend program, so `ask-glm` records under
 `claude/glm-5.2-1m` and `ask-claude` under `claude/claude-opus-5-1m`. The
-wrapper prints the directory to stderr as the run starts.
+wrapper prints a caller-stderr hint naming that run's `stderr` file as the run
+starts.
 
 | File | Contents |
 | --- | --- |
 | `config.toml` | The request, the command and its observed resolved target, the environment the wrapper changed, and a `[result]` table appended when the run ends. |
 | `prompt.md` | The prompt exactly as delivered to the backend. `ask-codex` and `ask-kimi` carry the policy inside it, `ask-claude` and `ask-glm` pass the policy separately, and `policy_inlined` records which happened. |
-| `stdout`, `stderr` | The displayed final answer and process transcript. The recorded `stdout` and `stderr` match the corresponding caller streams except for wrapper-only diagnostics such as the record path and storage warnings. |
+| `stdout`, `stderr` | The final answer and process transcript. In every mode, recorded `stdout` matches caller stdout. Recorded `stderr` retains the structured transcript and backend-native diagnostics that are hidden from the caller. |
 | `reproduce.cmd` | An executable `/bin/sh` script that re-runs the same invocation: the observed program path, every argument expanded and quoted, the working directory, and the environment changes. |
 
 `[request].prompt_from_stdin` says whether the wrapper consumed standard input
@@ -217,11 +227,12 @@ the backend anyway, so the affected record may be incomplete. Normal record
 writes enter a bounded FIFO in order, so an in-flight write does not suppress
 later chunks or permit unbounded memory growth. If the FIFO cannot make progress
 within its fixed wait, or record closing sees no progress for a fixed no-progress
-grace, the wrapper stops recording that stream, warns once, and continues
-mirroring backend output to the caller. The closing deadline restarts after each
-accepted chunk completes, preserving a healthy queue tail; the bounded FIFO
-keeps the total shutdown wait finite. In other words, if record storage blocks,
-backend execution and caller output remain authoritative.
+grace, the wrapper stops recording that stream, warns once, and continues the
+backend execution and caller output defined by the selected mode. The closing
+deadline restarts after each accepted chunk completes, preserving a healthy
+queue tail; the bounded FIFO keeps the total shutdown wait finite. In other
+words, if record storage blocks, backend execution and caller output remain
+authoritative.
 Records are not pruned or size-limited; choose a location with enough capacity
 and manage its retention explicitly.
 

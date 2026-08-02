@@ -811,7 +811,11 @@ def _open_record(
         )
         return None
 
-    _diagnostic("ask-{}: record {}".format(backend, record.path))
+    _diagnostic(
+        "Hint: please check {} for in-progress output.".format(
+            record.path / "stderr"
+        )
+    )
     return record
 
 
@@ -1144,7 +1148,12 @@ def _stream(
     input_offset = 0
     input_open = input_stream is not None
 
-    def output_destination(name: str) -> Optional[str]:
+    def terminal_destination(name: str) -> Optional[str]:
+        if name == "stderr" or structured_output is not None:
+            return None
+        return name
+
+    def record_destination(name: str) -> Optional[str]:
         if name == "stdout" and structured_output is not None:
             return "stderr" if structured_output.transcript_output else None
         return name
@@ -1156,7 +1165,7 @@ def _stream(
             pass
 
     def register_backend(name: str) -> None:
-        destination = output_destination(name)
+        destination = terminal_destination(name)
         if (
             backend_open[name]
             and not backend_registered[name]
@@ -1207,7 +1216,7 @@ def _stream(
         unregister_writer(name)
         pending[name] = False
         for source in backend_streams:
-            if output_destination(source) == name:
+            if terminal_destination(source) == name:
                 close_backend(source)
         if sigpipe_delivered:
             return
@@ -1232,18 +1241,25 @@ def _stream(
         for source in backend_streams:
             register_backend(source)
 
-    def submit_output(name: str, content: bytes) -> None:
+    def submit_record(name: str, content: bytes) -> None:
+        if not content:
+            return
+        record_writer = record_writers.get(name)
+        if record_writer is not None and not record_writer.submit(content):
+            record_writers.pop(name, None)
+
+    def submit_terminal(name: str, content: bytes) -> None:
         if not content:
             return
         if pending[name]:
             raise RuntimeError("{} writer already has pending output".format(name))
         for source in backend_streams:
-            if output_destination(source) == name and backend_registered[source]:
+            if (
+                terminal_destination(source) == name
+                and backend_registered[source]
+            ):
                 unregister(backend_streams[source])
                 backend_registered[source] = False
-        record_writer = record_writers.get(name)
-        if record_writer is not None and not record_writer.submit(content):
-            record_writers.pop(name, None)
         pending[name] = True
         writers[name].submit(content)
         register_writer(name)
@@ -1357,13 +1373,18 @@ def _stream(
                 if not chunk:
                     close_backend(name)
                     if name == "stdout" and structured_output is not None:
-                        submit_output("stdout", structured_output.finish())
+                        final_output = structured_output.finish()
+                        submit_record("stdout", final_output)
+                        submit_terminal("stdout", final_output)
                     continue
                 if name == "stdout" and structured_output is not None:
                     structured_output.feed(chunk)
-                destination = output_destination(name)
-                if destination is not None:
-                    submit_output(destination, chunk)
+                recorded_as = record_destination(name)
+                if recorded_as is not None:
+                    submit_record(recorded_as, chunk)
+                displayed_as = terminal_destination(name)
+                if displayed_as is not None:
+                    submit_terminal(displayed_as, chunk)
 
             if signal_interrupted_backpressure():
                 terminate_backend = True
