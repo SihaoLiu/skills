@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+
+import sys
+from pathlib import Path
+
+# Add the _ask_lib directory to the Python path
+_ask_lib_path = Path(__file__).resolve().parent.parent / "_ask_lib"
+sys.path.insert(0, str(_ask_lib_path))
+
+from ask_common import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main("codex"))

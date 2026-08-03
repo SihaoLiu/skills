@@ -167,7 +167,10 @@ def parse_request(
         "--progress",
         choices=("stderr", "off"),
         default="stderr",
-        help="write the structured event transcript to stderr (default: stderr)",
+        help=(
+            "record structured events in the invocation record; "
+            "off disables them (default: stderr)"
+        ),
     )
     parser.add_argument(
         "--policy-file",

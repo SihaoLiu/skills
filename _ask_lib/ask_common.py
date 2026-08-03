@@ -149,6 +149,7 @@ def _codex_command(
         command.append("resume")
     command.extend(
         [
+            "--skip-git-repo-check",
             "--model",
             CODEX_MODEL,
             "--config",
